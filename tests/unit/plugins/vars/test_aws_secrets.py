@@ -79,12 +79,13 @@ class AwsSecretsPluginTests(unittest.TestCase):
         defaults = {
             "stage": "inventory",
             "prefix": "ansible/{{ inventory_hostname }}/",
+            "group_prefix": None,
             "region": "us-west-2",
             "profile": None,
             "cache_ttl": 300,
             "nested": False,
             "strict": True,
-            "include_groups": False,
+            "binary_format": "base64",
         }
         defaults.update(option_overrides)
 
@@ -306,14 +307,207 @@ class AwsSecretsPluginTests(unittest.TestCase):
             result = plugin.get_vars(_LoaderStub(), "/inv", [_FakeHost("web1")])
         self.assertEqual(result, {})
 
+    # ---- per-secret Errors (strict semantics) ----------------------------
+
+    def test_strict_raises_on_per_secret_errors(self):
+        from ansible.errors import AnsibleParserError
+
+        self._install_fake_client([
+            {
+                "SecretValues": [
+                    {"Name": "ansible/web1/ok", "SecretString": json.dumps({"OK": 1})},
+                ],
+                "Errors": [
+                    {
+                        "SecretId": "ansible/web1/broken",
+                        "ErrorCode": "DecryptionFailure",
+                        "Message": "KMS denied",
+                    },
+                ],
+            },
+        ])
+
+        plugin = self._make_plugin(strict=True)
+        with self.assertRaises(AnsibleParserError) as cm:
+            plugin.get_vars(_LoaderStub(), "/inv", [_FakeHost("web1")])
+        self.assertIn("DecryptionFailure", str(cm.exception))
+        self.assertIn("ansible/web1/broken", str(cm.exception))
+
+    def test_strict_aggregates_errors_across_pages(self):
+        from ansible.errors import AnsibleParserError
+
+        self._install_fake_client([
+            {
+                "SecretValues": [],
+                "Errors": [
+                    {"SecretId": "a", "ErrorCode": "DecryptionFailure", "Message": "x"},
+                ],
+                "NextToken": "tok",
+            },
+            {
+                "SecretValues": [],
+                "Errors": [
+                    {"SecretId": "b", "ErrorCode": "AccessDeniedException", "Message": "y"},
+                ],
+            },
+        ])
+
+        plugin = self._make_plugin(strict=True)
+        with self.assertRaises(AnsibleParserError) as cm:
+            plugin.get_vars(_LoaderStub(), "/inv", [_FakeHost("web1")])
+        msg = str(cm.exception)
+        self.assertIn("a:", msg)
+        self.assertIn("b:", msg)
+        self.assertIn("2 per-secret error", msg)
+
+    def test_non_strict_returns_partial_on_per_secret_errors(self):
+        self._install_fake_client([
+            {
+                "SecretValues": [
+                    {"Name": "ansible/web1/ok", "SecretString": json.dumps({"OK": 1})},
+                ],
+                "Errors": [
+                    {"SecretId": "ansible/web1/bad", "ErrorCode": "DecryptionFailure", "Message": "x"},
+                ],
+            },
+        ])
+
+        plugin = self._make_plugin(strict=False)
+        result = plugin.get_vars(_LoaderStub(), "/inv", [_FakeHost("web1")])
+        self.assertEqual(result, {"OK": 1})
+
     # ---- groups -----------------------------------------------------------
 
-    def test_groups_skipped_by_default(self):
+    def test_groups_skipped_when_no_group_prefix(self):
         client = self._install_fake_client([])
-        plugin = self._make_plugin()
+        plugin = self._make_plugin(group_prefix=None)
         result = plugin.get_vars(_LoaderStub(), "/inv", [_FakeGroup("web")])
         self.assertEqual(result, {})
         client.batch_get_secret_value.assert_not_called()
+
+    def test_groups_use_group_prefix_with_group_name(self):
+        client = self._install_fake_client([
+            {
+                "SecretValues": [
+                    {"Name": "ansible/groups/web/shared", "SecretString": json.dumps({"SHARED": "v"})},
+                ],
+            },
+        ])
+
+        plugin = self._make_plugin(
+            prefix=None,
+            group_prefix="ansible/groups/{{ group_name }}/",
+        )
+        result = plugin.get_vars(_LoaderStub(), "/inv", [_FakeGroup("web")])
+        self.assertEqual(result, {"SHARED": "v"})
+        kwargs = client.batch_get_secret_value.call_args.kwargs
+        self.assertEqual(kwargs["Filters"][0]["Values"], ["ansible/groups/web/"])
+
+    def test_group_prefix_does_not_resolve_inventory_hostname(self):
+        # The whole point of separating the option: a group_prefix that
+        # references inventory_hostname must fail clearly, not silently
+        # masquerade with the group name as the host name.
+        self._install_fake_client([])
+
+        plugin = self._make_plugin(
+            prefix=None,
+            group_prefix="ansible/{{ inventory_hostname }}/",  # wrong on purpose
+        )
+        # Templating fails → warning emitted, empty dict returned, no API call.
+        result = plugin.get_vars(_LoaderStub(), "/inv", [_FakeGroup("web")])
+        self.assertEqual(result, {})
+
+    def test_host_prefix_does_not_resolve_group_name(self):
+        # Symmetric guarantee: host context never sees `group_name`.
+        self._install_fake_client([])
+
+        plugin = self._make_plugin(
+            prefix="ansible/{{ group_name }}/",  # wrong on purpose
+        )
+        result = plugin.get_vars(_LoaderStub(), "/inv", [_FakeHost("web1")])
+        self.assertEqual(result, {})
+
+    def test_no_prefix_and_no_group_prefix_is_noop(self):
+        client = self._install_fake_client([])
+        plugin = self._make_plugin(prefix=None, group_prefix=None)
+        result = plugin.get_vars(
+            _LoaderStub(),
+            "/inv",
+            [_FakeHost("web1"), _FakeGroup("web")],
+        )
+        self.assertEqual(result, {})
+        client.batch_get_secret_value.assert_not_called()
+
+    # ---- SecretBinary handling -------------------------------------------
+
+    def test_binary_format_base64_default(self):
+        self._install_fake_client([
+            {
+                "SecretValues": [
+                    {"Name": "ansible/web1/cert", "SecretBinary": b"\x00\x01\x02hello"},
+                ],
+            },
+        ])
+
+        plugin = self._make_plugin()
+        result = plugin.get_vars(_LoaderStub(), "/inv", [_FakeHost("web1")])
+        import base64 as _b64
+        expected = _b64.b64encode(b"\x00\x01\x02hello").decode("ascii")
+        self.assertEqual(result, {"cert": expected})
+        # Round-trip: confirm the value survives a JSON round-trip, which is
+        # the whole point of preferring base64 over raw bytes.
+        self.assertEqual(json.loads(json.dumps(result)), {"cert": expected})
+
+    def test_binary_format_raw_returns_bytes(self):
+        self._install_fake_client([
+            {
+                "SecretValues": [
+                    {"Name": "ansible/web1/cert", "SecretBinary": b"raw-bytes"},
+                ],
+            },
+        ])
+
+        plugin = self._make_plugin(binary_format="raw")
+        result = plugin.get_vars(_LoaderStub(), "/inv", [_FakeHost("web1")])
+        self.assertEqual(result, {"cert": b"raw-bytes"})
+
+    def test_binary_format_skip_drops_binary_secrets(self):
+        self._install_fake_client([
+            {
+                "SecretValues": [
+                    {"Name": "ansible/web1/cert", "SecretBinary": b"x"},
+                    {"Name": "ansible/web1/db", "SecretString": json.dumps({"DB": 1})},
+                ],
+            },
+        ])
+
+        plugin = self._make_plugin(binary_format="skip")
+        result = plugin.get_vars(_LoaderStub(), "/inv", [_FakeHost("web1")])
+        self.assertEqual(result, {"DB": 1})
+
+    # ---- set_options error reporting -------------------------------------
+
+    def test_set_options_failure_warns_and_continues(self):
+        plugin = aws_secrets.VarsModule()
+
+        def boom(*a, **kw):
+            raise RuntimeError("synthetic config failure")
+
+        plugin.set_options = boom
+        # get_option still has to return something so the rest of get_vars
+        # can run; emulate "options were never loaded" returning None for
+        # everything (which is what AnsiblePlugin would do in practice).
+        plugin.get_option = lambda name: None
+
+        warnings: list[str] = []
+        with patch.object(aws_secrets.display, "warning", side_effect=warnings.append):
+            result = plugin.get_vars(_LoaderStub(), "/inv", [_FakeHost("web1")])
+
+        self.assertEqual(result, {})
+        self.assertTrue(
+            any("failed to load plugin options" in w for w in warnings),
+            f"expected a load-options warning, got: {warnings!r}",
+        )
 
     # ---- key sanitization -------------------------------------------------
 

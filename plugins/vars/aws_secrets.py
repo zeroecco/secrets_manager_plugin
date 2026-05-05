@@ -52,19 +52,34 @@ DOCUMENTATION = r"""
           - name: ANSIBLE_VARS_AWS_SECRETS_STAGE
       prefix:
         description:
-          - Prefix used to filter secret names.
+          - Prefix used to filter secret names for B(host) entities.
           - Templated against C(inventory_hostname), C(inventory_hostname_short)
-            and C(group_names) so per-host or per-group prefixes work, e.g.
-            C(ansible/{{ inventory_hostname }}/).
-          - The prefix is passed verbatim to the AWS C(name) filter, which is
-            a case-sensitive begins-with match.
+            and C(group_names). Note that C(group_name) is B(not) defined in
+            this context; use C(group_prefix) for group-scoped lookups.
+          - The resolved value is passed verbatim to the AWS C(name) filter,
+            which is a case-sensitive begins-with match.
+          - If unset, no host-scoped lookups are performed.
         type: str
-        required: true
+        required: false
         ini:
           - section: vars_aws_secrets
             key: prefix
         env:
           - name: ANSIBLE_VARS_AWS_SECRETS_PREFIX
+      group_prefix:
+        description:
+          - Prefix used to filter secret names for B(group) entities.
+          - Templated against C(group_name) only. C(inventory_hostname) is
+            B(not) defined in this context; mixing the two in one template
+            was previously possible and was a footgun.
+          - If unset (default), groups are skipped entirely.
+        type: str
+        required: false
+        ini:
+          - section: vars_aws_secrets
+            key: group_prefix
+        env:
+          - name: ANSIBLE_VARS_AWS_SECRETS_GROUP_PREFIX
       region:
         description:
           - AWS region. If unset, falls back to the standard boto3 chain
@@ -113,9 +128,14 @@ DOCUMENTATION = r"""
           - name: ANSIBLE_VARS_AWS_SECRETS_NESTED
       strict:
         description:
-          - When C(true), AWS / boto3 errors abort inventory parsing.
-          - When C(false), errors are logged as warnings and the most recent
-            cached result (or an empty dict) is returned.
+          - When C(true), B(any) error from AWS — transport (C(BotoCoreError),
+            C(ClientError)) B(or) per-secret entries in the response's
+            C(Errors) list (e.g. C(DecryptionFailure), C(AccessDeniedException)
+            on a single secret) — aborts inventory parsing.
+          - When C(false), all errors are logged as warnings. Transport errors
+            fall back to the most recent cached result, or an empty dict.
+            Per-secret errors yield a partial result containing whatever
+            secrets were successfully fetched.
         type: bool
         default: true
         ini:
@@ -123,18 +143,26 @@ DOCUMENTATION = r"""
             key: strict
         env:
           - name: ANSIBLE_VARS_AWS_SECRETS_STRICT
-      include_groups:
+      binary_format:
         description:
-          - When C(true), the plugin also resolves and fetches secrets for
-            inventory groups (using C(group_name) in the prefix template).
-          - Disabled by default since per-host prefixes are the canonical case.
-        type: bool
-        default: false
+          - How to encode C(SecretBinary) values for use as Ansible variables.
+          - C(base64) (default) yields a UTF-8 string of the standard base64
+            encoding. JSON-safe and easy to reverse with the C(b64decode) filter.
+          - C(raw) yields a Python C(bytes) object.
+          - "Warning about C(raw): bytes do not survive JSON serialization,
+            so playbooks that pass these values through C(to_json), C(to_yaml),
+            or copy them across worker processes (forks, callback plugins,
+            fact cache) may fail. Use only when you control the consumer."
+          - C(skip) drops binary secrets entirely; only string secrets are
+            exposed.
+        type: str
+        choices: ['base64', 'raw', 'skip']
+        default: base64
         ini:
           - section: vars_aws_secrets
-            key: include_groups
+            key: binary_format
         env:
-          - name: ANSIBLE_VARS_AWS_SECRETS_INCLUDE_GROUPS
+          - name: ANSIBLE_VARS_AWS_SECRETS_BINARY_FORMAT
 """
 
 EXAMPLES = r"""
@@ -158,9 +186,11 @@ EXAMPLES = r"""
 #       - debug: var=API_KEY
 """
 
+import base64
 import json
 import os
 import time
+import traceback
 from threading import Lock
 
 try:
@@ -273,13 +303,28 @@ class VarsModule(BaseVarsPlugin):
         super().get_vars(loader, path, entities)
 
         # Vars plugins are Configurable; populate options from ini/env/etc.
+        # set_options() can fail in legitimate ways (a malformed value in the
+        # ini section, an env var that fails type coercion). Silently dropping
+        # to vvv hid those failures and made the plugin look like a no-op
+        # rather than a misconfiguration. Warn loudly; emit the traceback at
+        # vvv for the operators who want it.
         try:
             self.set_options()
-        except Exception as exc:  # pragma: no cover - defensive
-            display.vvv("aws_secrets: set_options failed: %s" % exc)
+        except Exception as exc:
+            display.warning(
+                "aws_secrets: failed to load plugin options "
+                "(check [vars_aws_secrets] in ansible.cfg or "
+                "ANSIBLE_VARS_AWS_SECRETS_* env vars): %s: %s"
+                % (type(exc).__name__, exc)
+            )
+            display.vvv(
+                "aws_secrets: set_options traceback:\n%s" % traceback.format_exc()
+            )
 
         prefix_template = self._opt("prefix")
-        if not prefix_template:
+        group_prefix_template = self._opt("group_prefix")
+
+        if not prefix_template and not group_prefix_template:
             return {}
 
         region = self._opt("region") or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
@@ -287,23 +332,33 @@ class VarsModule(BaseVarsPlugin):
         cache_ttl = int(self._opt("cache_ttl", 300) or 0)
         nested = bool(self._opt("nested", False))
         strict = bool(self._opt("strict", True))
-        include_groups = bool(self._opt("include_groups", False))
+        binary_format = self._opt("binary_format", "base64") or "base64"
+        if binary_format not in ("base64", "raw", "skip"):
+            display.warning(
+                "aws_secrets: invalid binary_format=%r; falling back to 'base64'"
+                % binary_format
+            )
+            binary_format = "base64"
 
         merged: dict = {}
         for entity in entities:
             if isinstance(entity, Host):
+                if not prefix_template:
+                    continue
                 ctx = {
                     "inventory_hostname": entity.name,
                     "inventory_hostname_short": entity.name.split(".")[0],
                     "group_names": [g.name for g in getattr(entity, "groups", []) or []],
                 }
+                active_template = prefix_template
             elif isinstance(entity, Group):
-                if not include_groups:
+                if not group_prefix_template:
                     continue
-                ctx = {
-                    "group_name": entity.name,
-                    "inventory_hostname": entity.name,
-                }
+                # Deliberately scoped: only `group_name` is defined here.
+                # Templates that try to use `inventory_hostname` will raise
+                # AnsibleUndefinedVariable, which we surface as a warning.
+                ctx = {"group_name": entity.name}
+                active_template = group_prefix_template
             else:
                 continue
 
@@ -311,12 +366,13 @@ class VarsModule(BaseVarsPlugin):
                 loader=loader,
                 ctx=ctx,
                 entity_name=entity.name,
-                prefix_template=prefix_template,
+                prefix_template=active_template,
                 region=region,
                 profile=profile,
                 cache_ttl=cache_ttl,
                 nested=nested,
                 strict=strict,
+                binary_format=binary_format,
                 cache=cache,
             )
             merged.update(entity_vars)
@@ -341,6 +397,7 @@ class VarsModule(BaseVarsPlugin):
         cache_ttl,
         nested,
         strict,
+        binary_format,
         cache,
     ):
         # Resolve the prefix template against the entity context. We construct
@@ -375,7 +432,9 @@ class VarsModule(BaseVarsPlugin):
                     return dict(entry[1])
 
         try:
-            data = self._fetch_secrets(resolved_prefix, region, profile, nested)
+            data = self._fetch_secrets(
+                resolved_prefix, region, profile, nested, strict, binary_format
+            )
         except (BotoCoreError, ClientError) as exc:
             if strict:
                 raise AnsibleParserError(
@@ -395,11 +454,16 @@ class VarsModule(BaseVarsPlugin):
 
         return dict(data)
 
-    def _fetch_secrets(self, prefix, region, profile, nested):
+    def _fetch_secrets(self, prefix, region, profile, nested, strict, binary_format):
         client = _get_client(profile, region)
         # We sort the secrets by name before merging so that "last write wins"
         # collisions are deterministic across runs.
         collected: list[tuple[str, object]] = []
+        # Per-secret errors returned in the response's Errors list (e.g.
+        # DecryptionFailure, AccessDeniedException for an individual secret).
+        # Accumulated across pagination so that strict-mode failures report
+        # every problem secret, not just the first page's.
+        per_secret_errors: list[dict] = []
 
         next_token = None
         while True:
@@ -413,20 +477,26 @@ class VarsModule(BaseVarsPlugin):
 
             for err in response.get("Errors", []) or []:
                 display.warning(
-                    "aws_secrets: error from BatchGetSecretValue for %s: %s %s"
+                    "aws_secrets: per-secret error for %s: %s %s"
                     % (
                         err.get("SecretId"),
                         err.get("ErrorCode"),
                         err.get("Message"),
                     )
                 )
+                per_secret_errors.append(err)
 
             for secret in response.get("SecretValues", []) or []:
                 name = secret.get("Name", "")
                 if "SecretString" in secret and secret["SecretString"] is not None:
                     parsed = self._parse(secret["SecretString"])
                 elif "SecretBinary" in secret and secret["SecretBinary"] is not None:
-                    parsed = secret["SecretBinary"]
+                    if binary_format == "skip":
+                        continue
+                    if binary_format == "base64":
+                        parsed = base64.b64encode(secret["SecretBinary"]).decode("ascii")
+                    else:  # raw
+                        parsed = secret["SecretBinary"]
                 else:
                     continue
                 collected.append((name, parsed))
@@ -434,6 +504,22 @@ class VarsModule(BaseVarsPlugin):
             next_token = response.get("NextToken")
             if not next_token:
                 break
+
+        if per_secret_errors and strict:
+            summary = "; ".join(
+                "%s: %s %s"
+                % (
+                    err.get("SecretId"),
+                    err.get("ErrorCode"),
+                    err.get("Message"),
+                )
+                for err in per_secret_errors
+            )
+            raise AnsibleParserError(
+                "aws_secrets: BatchGetSecretValue returned %d per-secret error(s) "
+                "with prefix %r and strict=true: %s"
+                % (len(per_secret_errors), prefix, summary)
+            )
 
         collected.sort(key=lambda item: item[0])
 

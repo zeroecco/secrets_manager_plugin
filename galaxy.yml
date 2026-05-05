@@ -16,8 +16,8 @@ tags:
   - secrets
   - vars
   - inventory
-repository: https://example.invalid/community/aws_secrets_manager
-issues: https://example.invalid/community/aws_secrets_manager/issues
+repository: https://github.com/zeroecco/secrets_manager_plugin
+issues: https://github.com/zeroecco/secrets_manager_plugin/issues
 dependencies: {}
 build_ignore:
   - .venv

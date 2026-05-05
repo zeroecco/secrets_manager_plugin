@@ -30,7 +30,7 @@ No `lookup('aws_secret', ...)`, no extra Jinja, no recomputation per task.
 ## Install
 
 ```bash
-ansible-galaxy collection install git+https://example.invalid/community/aws_secrets_manager.git
+ansible-galaxy collection install git+https://github.com/zeroecco/secrets_manager_plugin.git
 pip install boto3
 ```
 
@@ -86,7 +86,7 @@ export ANSIBLE_VARS_AWS_SECRETS_REGION=us-west-2
 
 Secrets in AWS:
 
-```
+```text
 ansible/web1/database -> {"DB_HOST": "db.internal", "DB_PASS": "hunter2"}
 ansible/web1/api      -> {"API_KEY": "abc123"}
 ansible/web2/database -> {"DB_HOST": "db2.internal", "DB_PASS": "hunter2"}
@@ -105,19 +105,70 @@ Playbook:
 
 ## Options
 
-| Option           | Default     | Description                                           |
-| ---------------- | ----------- | ----------------------------------------------------- |
-| `prefix`         | (required)  | Templated secret-name prefix. Server-side prefix match. |
-| `region`         | env / boto3 | AWS region.                                           |
-| `profile`        | env / boto3 | Named AWS profile.                                    |
-| `stage`          | `inventory` | When the plugin runs (`inventory`, `task`, `all`).    |
-| `cache_ttl`      | `300`       | In-process cache TTL in seconds. `0` disables.        |
-| `nested`         | `false`     | Namespace each secret under its basename instead of merging JSON keys flat. |
-| `strict`         | `true`      | Raise on AWS errors. When `false`, log warning and return last cached / empty. |
-| `include_groups` | `false`     | Also resolve prefixes for inventory groups.           |
+| Option          | Default     | Description                                                                                       |
+| --------------- | ----------- | ------------------------------------------------------------------------------------------------- |
+| `prefix`        | _(unset)_   | Templated secret-name prefix for **host** entities. Resolved against `inventory_hostname`.        |
+| `group_prefix`  | _(unset)_   | Templated secret-name prefix for **group** entities. Resolved against `group_name` only.          |
+| `region`        | env / boto3 | AWS region.                                                                                       |
+| `profile`       | env / boto3 | Named AWS profile.                                                                                |
+| `stage`         | `inventory` | When the plugin runs (`inventory`, `task`, `all`).                                                |
+| `cache_ttl`     | `300`       | In-process cache TTL in seconds. `0` disables.                                                    |
+| `nested`        | `false`     | Namespace each secret under its basename instead of merging JSON keys flat.                       |
+| `strict`        | `true`      | Raise on **any** AWS error (transport or per-secret). When `false`, warn + partial/cached return. |
+| `binary_format` | `base64`    | How to expose `SecretBinary` values: `base64` (string), `raw` (bytes), or `skip` (drop).          |
 
-Each option can be set via `ansible.cfg` under `[vars_aws_secrets]` or via an
-`ANSIBLE_VARS_AWS_SECRETS_*` environment variable.
+If both `prefix` and `group_prefix` are unset the plugin is a no-op. Set
+either or both. Each option can be set via `ansible.cfg` under
+`[vars_aws_secrets]` or via an `ANSIBLE_VARS_AWS_SECRETS_*` environment
+variable.
+
+### `strict` semantics
+
+Two failure modes look identical from a caller's perspective but want
+different ergonomics. `strict` ties them together:
+
+- **Transport errors** (`BotoCoreError`, `ClientError` from `boto3` itself
+  — bad creds, network timeout, throttling, region misconfigured).
+- **Per-secret errors** in the `BatchGetSecretValue` response's `Errors`
+  list (e.g. `DecryptionFailure` because KMS denied this caller for one
+  particular secret, `AccessDeniedException` on a single ARN).
+
+When `strict=true` (default), either kind aborts inventory parsing with a
+clear `AnsibleParserError`. Per-secret errors are aggregated across all
+paginated pages so the failure message lists every problem secret, not
+just the first one.
+
+When `strict=false`, transport errors fall back to the most recent cached
+result or an empty dict; per-secret errors yield a partial result
+containing whatever did fetch successfully. Both paths log warnings.
+
+### Host vs. group prefix templates
+
+`prefix` and `group_prefix` are deliberately separate. The host context
+defines `inventory_hostname`, `inventory_hostname_short`, and
+`group_names`; the group context defines only `group_name`. Mixing them
+across templates was previously possible (groups quietly received
+`inventory_hostname=<group_name>`), which produced confusing failure
+modes. Now an out-of-scope variable raises `AnsibleUndefinedVariable`,
+which the plugin surfaces as a warning and a no-op for that entity.
+
+### Binary secret values
+
+`SecretBinary` is returned by AWS as `bytes`. By default the plugin
+base64-encodes it into an ASCII string so it survives JSON/YAML
+serialization, fact caches, and inter-process copies. Reverse it in a
+playbook with the `b64decode` filter:
+
+```yaml
+- copy:
+    content: "{{ tls_key_pem | b64decode }}"
+    dest: /etc/ssl/private/host.key
+```
+
+Use `binary_format: raw` only if you control the consumer end-to-end —
+Python `bytes` objects cannot round-trip through JSON, so they will break
+fact caching, callback plugins, and many third-party modules. Use
+`binary_format: skip` to drop binary secrets entirely.
 
 ## IAM
 
@@ -140,7 +191,7 @@ The minimum policy:
 }
 ```
 
-`BatchGetSecretValue` requires both `secretsmanager:BatchGetSecretValue` *and*
+`BatchGetSecretValue` requires both `secretsmanager:BatchGetSecretValue` _and_
 `secretsmanager:GetSecretValue` on each secret it returns.
 
 ## Development
