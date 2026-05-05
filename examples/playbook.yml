@@ -1,0 +1,11 @@
+---
+- hosts: all
+  gather_facts: false
+  tasks:
+    - name: Show DB_HOST resolved from AWS Secrets Manager
+      ansible.builtin.debug:
+        var: DB_HOST
+
+    - name: Show API_KEY resolved from AWS Secrets Manager
+      ansible.builtin.debug:
+        var: API_KEY

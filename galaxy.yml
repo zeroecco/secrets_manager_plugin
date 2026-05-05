@@ -1,0 +1,28 @@
+---
+namespace: community
+name: aws_secrets_manager
+version: 0.1.0
+readme: README.md
+authors:
+  - zeroecco
+description: >-
+  Ansible vars plugin that loads per-host variables from AWS Secrets Manager
+  using the BatchGetSecretValue API. Aggressively cached, opt-in via
+  vars_plugins_enabled.
+license:
+  - Apache-2.0
+tags:
+  - aws
+  - secrets
+  - vars
+  - inventory
+repository: https://example.invalid/community/aws_secrets_manager
+issues: https://example.invalid/community/aws_secrets_manager/issues
+dependencies: {}
+build_ignore:
+  - .venv
+  - .git
+  - .github
+  - .pytest_cache
+  - __pycache__
+  - "*.pyc"
