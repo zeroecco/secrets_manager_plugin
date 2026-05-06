@@ -1,5 +1,7 @@
 # community.aws_secrets_manager
 
+[![ci](https://github.com/zeroecco/secrets_manager_plugin/actions/workflows/ci.yml/badge.svg)](https://github.com/zeroecco/secrets_manager_plugin/actions/workflows/ci.yml)
+
 An Ansible **vars plugin** that pulls per-host variables from
 [AWS Secrets Manager](https://docs.aws.amazon.com/secretsmanager/latest/userguide/intro.html)
 using the `BatchGetSecretValue` API. Aggressively cached, opt-in via
@@ -72,6 +74,8 @@ export ANSIBLE_VARS_AWS_SECRETS_REGION=us-west-2
 
 1. For each host being resolved, the plugin templates `prefix` against
    `inventory_hostname` (and `inventory_hostname_short`, `group_names`).
+   For each group being resolved, it templates `group_prefix` against
+   `group_name`. Either option may be unset to skip that scope.
 2. It calls `BatchGetSecretValue` with `Filters=[{Key: name, Values: [prefix]}]`,
    which does a server-side prefix match. Up to 20 secrets per call, paginated
    via `NextToken`.
@@ -156,19 +160,44 @@ which the plugin surfaces as a warning and a no-op for that entity.
 
 `SecretBinary` is returned by AWS as `bytes`. By default the plugin
 base64-encodes it into an ASCII string so it survives JSON/YAML
-serialization, fact caches, and inter-process copies. Reverse it in a
-playbook with the `b64decode` filter:
+serialization, fact caches, and inter-process copies.
 
-```yaml
-- copy:
-    content: "{{ tls_key_pem | b64decode }}"
-    dest: /etc/ssl/private/host.key
+End-to-end example. Store a TLS private key as a `SecretBinary`:
+
+```bash
+aws secretsmanager create-secret \
+  --name ansible/web1/tls-key \
+  --secret-binary fileb://./web1.key.pem
 ```
 
+With `prefix = ansible/{{ inventory_hostname }}/`, the plugin fetches
+that secret and exposes it under a sanitized key derived from the
+basename. `ansible/web1/tls-key` becomes the variable `tls_key`,
+holding the base64 string. Reverse it in a task with the `b64decode`
+filter:
+
+```yaml
+- hosts: web1
+  tasks:
+    - name: Install TLS private key
+      ansible.builtin.copy:
+        content: "{{ tls_key | b64decode }}"
+        dest: /etc/ssl/private/host.key
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+```
+
+(`no_log: true` keeps the secret out of stdout if a task is rerun in
+verbose mode.)
+
 Use `binary_format: raw` only if you control the consumer end-to-end —
-Python `bytes` objects cannot round-trip through JSON, so they will break
-fact caching, callback plugins, and many third-party modules. Use
-`binary_format: skip` to drop binary secrets entirely.
+Python `bytes` objects cannot round-trip through JSON, so they will
+break fact caching, callback plugins, and many third-party modules.
+Use `binary_format: skip` to drop binary secrets entirely (useful if a
+host's prefix happens to overlap with binary-only secrets you don't
+want this plugin to surface).
 
 ## IAM
 

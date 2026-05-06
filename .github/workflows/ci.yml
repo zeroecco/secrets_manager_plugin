@@ -1,0 +1,86 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint (pyflakes)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --upgrade pip && pip install pyflakes
+      - run: |
+          pyflakes \
+            plugins/vars/aws_secrets.py \
+            tests/unit/plugins/vars/test_aws_secrets.py \
+            tests/integration/sitecustomize_mock_boto3.py
+
+  unit:
+    name: unit (py${{ matrix.python }} / ${{ matrix.label }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Cover the supported ansible-core floor (2.15) through current
+        # stable. Python versions are picked to satisfy each ansible-core
+        # version's own support matrix.
+        include:
+          - python: "3.11"
+            label: "ansible-core 2.15 (floor)"
+            ansible: "ansible-core>=2.15,<2.16"
+          - python: "3.11"
+            label: "ansible-core 2.18"
+            ansible: "ansible-core>=2.18,<2.19"
+          - python: "3.12"
+            label: "ansible-core latest stable"
+            ansible: "ansible-core"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install ansible-core + boto3 + pytest
+        run: |
+          pip install --upgrade pip
+          pip install "${{ matrix.ansible }}" "boto3>=1.34.0" "botocore>=1.34.0" "pytest>=7"
+      - name: Show installed versions
+        run: |
+          python --version
+          python -c "import ansible; print('ansible', ansible.__version__)"
+          python -c "import boto3, botocore; print('boto3', boto3.__version__, 'botocore', botocore.__version__)"
+      - name: Run unit tests
+        run: python -m pytest tests/unit -v
+
+  smoke:
+    name: smoke (ansible-inventory end-to-end)
+    runs-on: ubuntu-latest
+    needs: [lint, unit]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ansible-core + boto3
+        run: |
+          pip install --upgrade pip
+          pip install ansible-core "boto3>=1.34.0" "botocore>=1.34.0"
+      - name: Run smoke test
+        env:
+          SMOKE_PYTHON: python
+          SMOKE_ANSIBLE_INVENTORY: ansible-inventory
+          SMOKE_ANSIBLE_GALAXY: ansible-galaxy
+        run: tests/integration/run_smoke.sh
