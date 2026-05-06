@@ -8,6 +8,7 @@ mocked: we never make a real AWS call.
 from __future__ import annotations
 
 import importlib.util
+import ipaddress
 import json
 import os
 import unittest
@@ -39,6 +40,19 @@ class _FakeHost:
     def __init__(self, name, groups=()):
         self.name = name
         self.groups = list(groups)
+
+    def get_magic_vars(self):
+        try:
+            ipaddress.ip_address(self.name)
+            inventory_hostname_short = self.name
+        except ValueError:
+            inventory_hostname_short = self.name.split(".")[0]
+
+        return {
+            "inventory_hostname": self.name,
+            "inventory_hostname_short": inventory_hostname_short,
+            "group_names": sorted(g.name for g in self.groups if g.name != "all"),
+        }
 
 
 class _FakeGroup:
@@ -268,6 +282,32 @@ class AwsSecretsPluginTests(unittest.TestCase):
             for call in client.batch_get_secret_value.call_args_list
         ]
         self.assertEqual(prefixes, ["ansible/web1/", "ansible/web2/"])
+
+    def test_inventory_hostname_short_keeps_ip_literals(self):
+        client = self._install_fake_client([
+            {"SecretValues": []},
+        ])
+
+        plugin = self._make_plugin(prefix="ansible/{{ inventory_hostname_short }}/")
+        plugin.get_vars(_LoaderStub(), "/inv", [_FakeHost("10.0.0.11")])
+
+        kwargs = client.batch_get_secret_value.call_args.kwargs
+        self.assertEqual(kwargs["Filters"][0]["Values"], ["ansible/10.0.0.11/"])
+
+    def test_group_names_matches_ansible_magic_var_semantics(self):
+        client = self._install_fake_client([
+            {"SecretValues": []},
+        ])
+
+        plugin = self._make_plugin(prefix="ansible/{{ group_names | join('/') }}/")
+        host = _FakeHost(
+            "web1",
+            groups=[_FakeGroup("web"), _FakeGroup("all"), _FakeGroup("app")],
+        )
+        plugin.get_vars(_LoaderStub(), "/inv", [host])
+
+        kwargs = client.batch_get_secret_value.call_args.kwargs
+        self.assertEqual(kwargs["Filters"][0]["Values"], ["ansible/app/web/"])
 
     # ---- error handling ---------------------------------------------------
 

@@ -345,11 +345,7 @@ class VarsModule(BaseVarsPlugin):
             if isinstance(entity, Host):
                 if not prefix_template:
                     continue
-                ctx = {
-                    "inventory_hostname": entity.name,
-                    "inventory_hostname_short": entity.name.split(".")[0],
-                    "group_names": [g.name for g in getattr(entity, "groups", []) or []],
-                }
+                ctx = entity.get_magic_vars()
                 active_template = prefix_template
             elif isinstance(entity, Group):
                 if not group_prefix_template:
